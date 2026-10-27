@@ -1,0 +1,721 @@
+---
+title: "Dating App Reviews: Text, Sentiment, Engagement, and Segments"
+subtitle: "Reproducible multi-question machine learning analysis"
+
+---
+
+## 1. Research Design and Setup
+
+This project analyzes user reviews from Tinder, Bumble, and Hinge. Five complementary research questions are addressed:
+
+1. **RQ1 — Sentiment:** Can review language predict the supplied positive/negative sentiment label? (Binary classification.)
+2. **RQ2 — Engagement:** Can review language and metadata predict whether a review receives at least one thumbs-up? (Binary classification.)
+3. **RQ3 — App identity:** Can review language distinguish Tinder, Bumble, and Hinge? (Multiclass classification.)
+4. **RQ4 — Time and platform:** How do observed negative-review shares differ by platform and month? (Descriptive comparison; no causal inference.)
+5. **RQ5 — Review themes:** What latent groups of review texts emerge, and how do their sentiment and app composition differ? (Unsupervised clustering.)
+
+**Important limitations:** `is_satisfied` exactly duplicates the sentiment information, and sentiment aligns perfectly with the observed rating categories in this dataset. Therefore rating, sentiment, and satisfaction must not be used as predictors of each other. The supplied sentiment label may itself have been generated from ratings; RQ1 evaluates *agreement with supplied labels*, not independently validated emotional understanding. No verified install counts, user demographics, or actual app quality outcomes are available. The data consist of reviews rather than a representative sample of users.
+
+An additional **aspect-level analysis** assigns multiple topics to each review and estimates topic-specific polarity using an explicitly heuristic, auditable method. These labels are not independent human annotations and should not be treated as ground truth.
+
+The three supervised tasks compare four models each: a dummy baseline, logistic regression, linear support vector classification, and random forest. The primary selection metric is **average precision (AP)** for the binary tasks and **macro-F1** for the multiclass task. Other metrics are reported to check tradeoffs. Model selection is based only on cross-validation of training data; the holdout test set is evaluated once for the selected model. Dummy baselines are never used for model visualizations or feature interpretation.
+
+```{python}
+# Run once if dependencies are missing:
+# %pip install pandas numpy scipy scikit-learn matplotlib seaborn
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, Normalizer
+from sklearn.impute import SimpleImputer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import (average_precision_score, roc_auc_score, f1_score,
+    accuracy_score, classification_report, ConfusionMatrixDisplay,
+    PrecisionRecallDisplay, RocCurveDisplay, silhouette_score)
+from sklearn.cluster import MiniBatchKMeans
+
+RANDOM_STATE = 42
+sns.set_theme(style='whitegrid')
+DATA_PATH = Path('dating_app_reviews_sentiment.csv')
+if not DATA_PATH.exists():
+    DATA_PATH = Path('/mnt/data/dating_app_reviews_sentiment.csv')
+if not DATA_PATH.exists():
+    raise FileNotFoundError('Put dating_app_reviews_sentiment.csv beside this QMD.')
+df = pd.read_csv(DATA_PATH)
+print('Shape:', df.shape)
+display(df.head(3))
+```
+
+## 2. Text Audit and Information-Preserving Preprocessing
+
+The dataset contains one free-text review column. A cell may contain multiple words, sentences, punctuation, negation, and descriptions of several issues. **Do not split a review into separate rows or replace it with an arbitrary integer label.** TF-IDF word unigrams, bigrams, and trigrams preserve many meaningful phrases (e.g., "not working"); character n-grams can capture spelling variation. Here word-level TF-IDF is the primary representation. Each review remains one observation. The original text is retained for inspection. No blanket stop-word removal or stemming is used because negations matter.
+
+```{python}
+print('Column types:')
+display(df.dtypes.rename('dtype').to_frame())
+print('Missingness:')
+display(df.isna().mean().sort_values(ascending=False).rename('missing_fraction').to_frame())
+print('Unique counts:')
+display(df.nunique().rename('n_unique').to_frame())
+text_audit = pd.DataFrame({
+    'characters': df['review_text'].fillna('').astype(str).str.len(),
+    'whitespace_tokens': df['review_text'].fillna('').astype(str).str.split().str.len(),
+    'sentence_punctuation': df['review_text'].fillna('').astype(str).str.count(r'[.!?]')
+})
+display(text_audit.describe(percentiles=[.5,.9,.95,.99]))
+print('Multiword review share:', round((text_audit.whitespace_tokens > 1).mean(), 4))
+print('Repeated full rows:', df.duplicated().sum())
+print('App distribution:'); display(df.app_name.value_counts())
+print('Sentiment/rating relationship:'); display(pd.crosstab(df.rating, df.sentiment))
+print('Sentiment/satisfaction relationship:'); display(pd.crosstab(df.sentiment, df.is_satisfied))
+
+# Clean only obvious formatting artifacts; preserve original text in review_text.
+def clean_review(s):
+    s = '' if pd.isna(s) else str(s)
+    s = re.sub(r'https?://\S+|www\.\S+', ' URLTOKEN ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+df['text_clean'] = df['review_text'].map(clean_review)
+df['posted_at'] = pd.to_datetime(df['posted_at'], errors='coerce')
+df['month'] = df['posted_at'].dt.to_period('M').astype(str)
+df['has_thumbs_up'] = (df['thumbs_up'] > 0).astype(int)
+print('Invalid timestamps:', df.posted_at.isna().sum())
+print('Blank reviews:', df.text_clean.eq('').sum())
+print('Engagement distribution:'); display(df.has_thumbs_up.value_counts(normalize=True))
+```
+
+
+
+# Data Quality and Text Inspection Analysis
+The dataset contains 10,709 dating app reviews across three platforms: Hinge (3,694), Bumble (3,562), and Tinder (3,453). The relatively balanced distribution across platforms supports meaningful comparisons of user experiences. No fully duplicated rows, blank reviews, or invalid timestamps were identified, indicating generally good data quality.
+
+Text Characteristics: Among the 10,709 reviews, 10,004 contain unique text, suggesting some repeated review content that should be examined to prevent data leakage during model training. Approximately 96.59% of reviews contain multiple words, with an average length of 24.92 words and 134 characters. Some reviews are considerably longer, reaching 105 words or 500 characters. These characteristics support the use of TF-IDF with unigrams, bigrams, and trigrams to capture meaningful words and phrases. Multi-label aspect detection and Aspect-Based Sentiment Analysis (ABSA) can further identify multiple topics and potentially different opinions within a single review.
+
+Sentiment Distribution and Data Leakage: The dataset shows a notable class imbalance, with 7,741 negative reviews (72.3%) and 2,968 positive reviews (27.7%). Therefore, accuracy alone may be misleading when evaluating sentiment classification models. Metrics such as Average Precision, Macro-F1, and Balanced Accuracy provide a more informative evaluation. Additionally, sentiment, rating, and satisfaction are perfectly aligned in the dataset. To prevent target leakage, rating and satisfaction should not be used as predictors when modeling sentiment.
+
+Review Engagement: Approximately 51.27% of reviews received at least one thumbs-up, while 48.73% received none. This relatively balanced distribution makes binary classification suitable for predicting review engagement. However, engagement may also depend on factors such as review visibility and posting time, so predictions should not be interpreted as causal effects of review content.
+
+Overall Assessment: The dataset is suitable for sentiment prediction, engagement classification, cross-platform comparisons, and text clustering. Combining traditional machine learning with TF-IDF and aspect-level analysis can provide insights into both overall user satisfaction and specific concerns, such as pricing, fake profiles, matching quality, and customer support. Nevertheless, repeated review texts, class imbalance, and the limitations of rule-based ABSA should be considered when interpreting the results.
+
+
+
+
+
+
+## 3. Exploratory Data Analysis
+
+These plots check class balance, differences among platforms, review length, and the heavily skewed engagement count. They are diagnostic, not causal.
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+sns.countplot(data=df, x='app_name', hue='sentiment', ax=axes[0,0])
+axes[0,0].set_title('Sentiment counts by app')
+share = pd.crosstab(df.app_name, df.sentiment, normalize='index')
+share.plot(kind='bar', stacked=True, ax=axes[0,1]); axes[0,1].set_title('Within-app sentiment shares')
+axes[0,1].set_ylabel('Share'); axes[0,1].legend(title='Sentiment')
+sns.boxplot(data=df, x='sentiment', y='review_word_count', showfliers=False, ax=axes[1,0])
+axes[1,0].set_title('Review word counts by sentiment (outliers hidden)')
+sns.histplot(np.log1p(df.thumbs_up), bins=30, ax=axes[1,1])
+axes[1,1].set_xlabel('log(1 + thumbs_up)'); axes[1,1].set_title('Engagement distribution')
+plt.tight_layout(); plt.show()
+```
+
+
+# Exploratory Data Analysis: Sentiment, Review Length, and Engagement
+1. Sentiment Distribution Across Dating Apps
+
+The sentiment count chart shows that negative reviews outnumber positive reviews across all three dating apps. Bumble has the highest number of negative reviews (approximately 2,900), followed by Hinge (2,700) and Tinder (2,100). In contrast, Tinder has the highest number of positive reviews (approximately 1,350), while Bumble has the fewest (approximately 600).
+
+The within-app sentiment proportions provide a more meaningful comparison by accounting for differences in sample size. Bumble has the highest negative sentiment share at approximately 82%, followed by Hinge at 73% and Tinder at 61%. Tinder has the highest positive sentiment share at approximately 39%.
+
+These results suggest that Bumble receives the most negative feedback in the dataset, while Tinder has a relatively more balanced sentiment distribution. However, these findings reflect the collected reviews rather than the overall satisfaction levels of all dating app users.
+
+2. Review Length by Sentiment
+
+The boxplot reveals a substantial difference in review length between negative and positive comments. Negative reviews have a median length of approximately 22 words, compared with only 5 words for positive reviews. Negative reviews also show greater variability, with a wider interquartile range.
+
+One possible explanation is that dissatisfied users tend to provide more detailed descriptions of their experiences, while satisfied users may leave shorter comments. However, the observed relationship does not establish the underlying motivation.
+
+This finding suggests that review length may be a useful predictive feature in sentiment classification. Nevertheless, models should be evaluated carefully to ensure that they capture meaningful textual information rather than relying excessively on review length.
+
+3. Review Engagement Distribution
+
+The engagement histogram shows a strongly right-skewed distribution of thumbs-up counts. Most reviews receive zero or relatively few likes, while a small number receive substantially higher engagement.
+
+A logarithmic transformation, log(1 + thumbs_up), is applied to reduce the influence of extreme values and improve the visualization of the distribution.
+
+The results indicate that review engagement is highly uneven. Although review content and sentiment may influence engagement, other factors such as visibility, posting time, and audience exposure may also contribute. Therefore, engagement predictions should not be interpreted as evidence of causal relationships.
+
+4. Overall Findings and Research Implications
+
+The exploratory analysis highlights three important patterns. First, sentiment distributions differ considerably across Tinder, Bumble, and Hinge, with Bumble showing the highest proportion of negative reviews and Tinder the highest proportion of positive reviews. Second, negative reviews tend to be longer and more variable than positive reviews, potentially providing richer textual information about user concerns. Third, review engagement is highly skewed, with most reviews receiving relatively few likes.
+
+These findings support further investigation using sentiment classification, Aspect-Based Sentiment Analysis (ABSA), and engagement prediction models. In particular, examining aspect-level sentiment across platforms may help identify whether dissatisfaction is associated with matching quality, subscription pricing, technical performance, or customer support.
+
+Conclusion: Overall, the EDA demonstrates meaningful differences in sentiment, review length, and engagement patterns. However, these relationships are descriptive rather than causal, and further modeling is needed to evaluate their predictive significance and practical implications.
+
+
+
+
+## 4. Multi-Label Aspect Detection and Aspect-Level Sentiment (ABSA)
+
+A review can describe several issues at once. We preserve **one row per review** and create **multiple binary aspect indicators**, not a single mutually exclusive topic code. The aspect dictionary below is an interpretable starting point tailored to dating-app reviews; inspect its precision on a manually labeled sample before drawing strong conclusions. Unmatched reviews are labeled `other_or_unspecified`, not silently discarded.
+
+For each matched aspect, the transparent *weak-supervision* polarity heuristic examines a local window around the aspect mention, uses a small opinion lexicon, and flips polarity after nearby negators. This is **approximate aspect-based sentiment**, not a validated pretrained ABSA model. It can miss sarcasm, implicit opinions, long-range dependencies, and ambiguous phrases. The dataset does not contain gold-standard aspect labels, so supervised aspect-specific predictive accuracy **cannot be established** from it.
+
+```{python}
+# Regex expressions are matched against lowercased original cleaned reviews.
+ASPECT_PATTERNS = {
+    'pricing_subscription': [r'\b(?:pay|paid|payment|premium|subscription|subscribe|price|pricing|cost|expensive|refund|charge|billing|boost|coins?)\b'],
+    'fake_profiles_scams': [r'\b(?:fake|bot|bots|scam|scammer|fraud|catfish|spam|fraudulent)\b'],
+    'matching_discovery': [r'\b(?:match|matches|matching|swip\w*|like|likes|algorithm|recommendation|discover|compatible)\b'],
+    'technical_performance': [r'\b(?:bug|bugs|crash\w*|glitch\w*|freeze|freez\w*|loading|login|log\s*in|update|error|slow|broken|stuck|notification|location|open the app)\b'],
+    'messaging_communication': [r'\b(?:messag\w*|chat\w*|conversation|reply|replies|respond|texting|inbox)\b'],
+    'support_moderation': [r'\b(?:support|customer service|help desk|report\w*|ban|banned|block\w*|appeal|moderator|verification|verify)\b'],
+    'safety_privacy': [r'\b(?:safe|safety|unsafe|privacy|private|harass\w*|creep\w*|security|data leak|personal information)\b'],
+    'usability_design': [r'\b(?:interface|design|layout|navigation|user friendly|easy to use|hard to use|feature|usability|intuitive)\b'],
+}
+ASPECT_REGEX = {a: re.compile('|'.join(p), re.I) for a,p in ASPECT_PATTERNS.items()}
+POS_WORDS = {'good','great','excellent','amazing','love','like','easy','helpful','fast','smooth',
+             'reliable','safe','fair','affordable','useful','happy','better','best','works','working','fixed'}
+NEG_WORDS = {'bad','terrible','awful','horrible','hate','poor','slow','broken','expensive','useless',
+             'fake','scam','buggy','unfair','unsafe','difficult','annoying','frustrating','worse',
+             'worst','crashes','crash','stuck','spam','unhelpful','disappointing','problem'}
+NEGATORS = {'not','no','never',"n't",'hardly','without'}
+TOKEN_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
+
+def aspect_analysis(review):
+    text = str(review).lower()
+    tokens = [(m.group(), m.start(), m.end()) for m in TOKEN_RE.finditer(text)]
+    found = {}
+    for aspect, regex in ASPECT_REGEX.items():
+        mentions = list(regex.finditer(text))
+        if not mentions:
+            continue
+        scores = []
+        for mention in mentions:
+            center = (mention.start()+mention.end())/2
+            nearest = min(range(len(tokens)), key=lambda i: abs((tokens[i][1]+tokens[i][2])/2-center)) if tokens else 0
+            lo, hi = max(0, nearest-7), min(len(tokens), nearest+8)
+            score = 0
+            for j in range(lo, hi):
+                word = tokens[j][0]
+                val = (1 if word in POS_WORDS else -1 if word in NEG_WORDS else 0)
+                if val:
+                    # Negation immediately before an opinion word.
+                    if any(tokens[t][0] in NEGATORS or tokens[t][0].endswith("n't")
+                           for t in range(max(lo, j-3), j)):
+                        val *= -1
+                    score += val
+            scores.append(score)
+        aggregate = sum(scores)
+        found[aspect] = ('positive' if aggregate > 0 else
+                         'negative' if aggregate < 0 else 'mixed_or_unclear')
+    return found
+
+aspect_results = df['text_clean'].map(aspect_analysis)
+for aspect in ASPECT_PATTERNS:
+    df['aspect_' + aspect] = aspect_results.map(lambda d: int(aspect in d))
+    df['polarity_' + aspect] = aspect_results.map(lambda d: d.get(aspect, 'not_mentioned'))
+aspect_cols = ['aspect_' + a for a in ASPECT_PATTERNS]
+df['n_aspects'] = df[aspect_cols].sum(axis=1)
+df['other_or_unspecified'] = df['n_aspects'].eq(0).astype(int)
+print('Share with multiple detected aspects:', round(df['n_aspects'].ge(2).mean(), 3))
+print('Share with no dictionary match:', round(df['other_or_unspecified'].mean(), 3))
+counts = df[aspect_cols].sum().sort_values()
+plt.figure(figsize=(10,5)); counts.plot.barh(); plt.title('Multi-label aspect mention counts')
+plt.xlabel('Reviews mentioning aspect (overlap allowed)'); plt.tight_layout(); plt.show()
+display(df[['review_text','n_aspects']+aspect_cols].head(8))
+```
+
+
+# Multi-Label Aspect Detection Analysis
+Overall Distribution: The chart illustrates the frequency of eight aspects identified in 10,709 dating app reviews. Since multi-label aspect detection allows each review to mention multiple topics, the categories are not mutually exclusive, and their total counts may exceed the number of reviews.
+
+Most Frequently Discussed Aspects: Matching and Discovery is the most frequently mentioned aspect, appearing in approximately 2,730 reviews, followed by Pricing and Subscription (2,050) and Support and Moderation (1,560). These findings suggest that users frequently discuss the core matching experience, subscription costs, and platform support services. However, high mention frequency does not necessarily indicate dissatisfaction, as comments may express either positive or negative opinions.
+
+Other Important Aspects: Technical Performance (1,150), Fake Profiles and Scams (1,000), and Messaging and Communication (930) also receive considerable attention. These aspects represent different dimensions of the user experience, including application reliability, profile authenticity, and communication functionality. Their presence suggests that user discussions extend beyond matching algorithms to broader concerns about platform functionality and trust.
+
+Less Frequently Mentioned Aspects: Usability and Design (320) and Safety and Privacy (160) have the lowest mention frequencies. However, fewer mentions do not necessarily imply lower importance or severity. Additionally, because aspect detection relies on predefined keywords and rules, some indirectly expressed concerns may not be captured.
+
+Implications for Further Analysis: Although the chart identifies the most frequently discussed aspects, it cannot determine which aspects generate the greatest dissatisfaction. Further Aspect-Based Sentiment Analysis (ABSA) is needed to compare positive and negative sentiment across different topics. Cross-platform comparisons and aspect co-occurrence analysis could also reveal whether particular concerns are more prevalent on specific dating apps or frequently appear together.
+
+Conclusion: Overall, matching experience, subscription pricing, and customer support dominate user discussions. However, discussion frequency should not be interpreted as a direct measure of dissatisfaction or problem severity. Combining aspect frequency with sentiment analysis and cross-platform comparisons will provide a more comprehensive understanding of user concerns and potential areas for improvement.
+
+
+
+
+
+
+
+### Aspect sentiment patterns by platform
+
+Only compare reviews *mentioning* an aspect. Neutral or mixed/unclear outcomes are retained rather than forced into positive/negative classes. Differences describe the sampled reviews and the lexicon's outputs; they are not proof of true user satisfaction or app quality.
+
+```{python}
+records = []
+for aspect in ASPECT_PATTERNS:
+    sub = df[df['aspect_'+aspect].eq(1)]
+    for app, g in sub.groupby('app_name'):
+        col = 'polarity_'+aspect
+        records.append({'aspect':aspect, 'app':app, 'n':len(g),
+                        'negative_share':g[col].eq('negative').mean(),
+                        'positive_share':g[col].eq('positive').mean(),
+                        'unclear_share':g[col].eq('mixed_or_unclear').mean()})
+aspect_summary = pd.DataFrame(records)
+display(aspect_summary.sort_values(['aspect','app']).round(3))
+# Avoid overinterpreting sparse cells: only visualize app-aspect cells with >= 20 reviews.
+valid = aspect_summary[aspect_summary.n >= 20]
+if not valid.empty:
+    matrix = valid.pivot(index='aspect',columns='app',values='negative_share')
+    plt.figure(figsize=(9,6)); sns.heatmap(matrix,annot=True,fmt='.2f',cmap='Reds',vmin=0,vmax=1)
+    plt.title('Heuristic negative polarity among aspect mentions (n >= 20)')
+    plt.tight_layout(); plt.show()
+# Illustrative review with multiple aspects and their local polarity.
+examples = df.loc[df.n_aspects.ge(2), ['review_text']].head(5).copy()
+examples['aspect_polarities'] = aspect_results.loc[examples.index]
+display(examples)
+```
+
+
+# Aspect-Based Sentiment Analysis: Negative Polarity Across Dating Apps
+Overall Findings: The heatmap compares heuristic negative sentiment proportions across eight aspects for Bumble, Hinge, and Tinder. The results reveal considerable differences between aspects, while most cross-platform differences are relatively small. Since the analysis uses rule-based sentiment detection, the values should be interpreted as exploratory estimates rather than validated measures of user dissatisfaction.
+
+Fake Profiles and Scams: This aspect shows the highest negative polarity across all three platforms, with approximately 68% for Bumble and Hinge and 67% for Tinder. The consistently high values suggest that discussions involving fake profiles and scams are particularly associated with negative expressions. However, the results may partly reflect the negative wording used in the aspect detection rules, requiring further validation.
+
+Technical Performance: Technical issues have the second-highest negative polarity, ranging from 30% to 36%. Tinder records the highest value (36%), compared with Bumble (31%) and Hinge (30%). This indicates that technical performance is an important area for further investigation, even for platforms with relatively higher overall positive sentiment shares.
+
+Pricing, Support, and Matching: Pricing and Subscription shows similar negative polarity across platforms (19%–21%), while Support and Moderation ranges from 17% to 22%. Matching and Discovery, despite being the most frequently mentioned aspect in the earlier analysis, has relatively low negative polarity (12%–15%). This highlights an important distinction between discussion frequency and negative sentiment: frequently mentioned topics are not necessarily those with the highest proportion of negative expressions.
+
+Messaging, Safety, and Usability: Messaging and Communication shows relatively low negative polarity (9%–14%). Safety and Privacy varies more noticeably, from 11% for Hinge to 23% for Tinder, while Usability and Design ranges from 11% to 17%. However, these aspects have fewer mentions, meaning their estimated proportions may be more sensitive to individual reviews and classification errors.
+
+Cross-Platform Comparison: Although Bumble has the highest overall negative sentiment share in the earlier EDA, it does not have the highest negative polarity for every individual aspect. Tinder shows higher negative proportions for Technical Performance and Safety and Privacy, while Bumble has the highest proportion for Support and Moderation. These findings suggest that overall sentiment and aspect-level sentiment capture different dimensions of user feedback.
+
+Limitations and Further Research: The analysis relies on predefined keywords and heuristic sentiment rules, which may fail to capture sarcasm, indirect complaints, complex negation, or multiple opinions within a single review. Additionally, the relatively low aspect-level negative proportions compared with the dataset's overall negative sentiment share suggest that further validation is necessary. Manual annotation of a sample of reviews would help assess the reliability of aspect detection and sentiment classification.
+
+Conclusion: Overall, Fake Profiles and Scams exhibits the strongest heuristic negative polarity across all three dating apps, followed by Technical Performance. The findings demonstrate that frequently discussed aspects are not necessarily associated with the highest negative sentiment proportions. Combining aspect frequency, aspect-level sentiment, and cross-platform comparisons provides a more detailed understanding of user concerns, although the results should remain exploratory until the rule-based classifications are validated.
+
+
+
+
+### Multi-label evaluation and what cannot be claimed
+
+These aspect indicators are **rules-derived pseudo-labels**, so training and testing a classifier on them would only measure how well it imitates the rules. It would not measure true aspect recognition or true ABSA accuracy. For a defensible supervised multi-label benchmark, first manually annotate a held-out sample (e.g., 200–400 reviews), permitting multiple aspects per review and a separate positive/negative/mixed/unclear label for each mentioned aspect. Evaluate aspect identification with **micro-F1, macro-F1, and per-aspect precision/recall**, and polarity with **per-aspect macro-F1**. Until such annotations exist, the tables above are exploratory only.
+
+## 5. Shared Model Evaluation Utilities
+
+**Leakage prevention:** RQ1 uses text only, excluding rating and satisfaction. RQ2 uses text, app name, and text length, excluding rating/sentiment/satisfaction to prevent target-proxy shortcuts. RQ3 uses text only and excludes the app name from predictors. All TF-IDF vocabulary fitting occurs within each training fold. Both the holdout split and cross-validation keep identical cleaned review texts in the same group. We use stratified random splits; because the data span time, results may be optimistic for deployment to later reviews. Identical cleaned reviews are assigned to the same side of a train/test split via group-aware splitting when duplicates exist.
+
+```{python}
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.base import clone
+
+def split_reviews(X, y, groups):
+    # StratifiedGroupKFold keeps identical texts together and approximates class balance.
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    tr, te = next(splitter.split(X, y, groups=groups))
+    return tr, te
+
+# Preserve short and long phrases, negations, and meaningful multiword expressions.
+def text_transformer():
+    # ColumnTransformer selects a 1-D Series rather than iterating DataFrame column names.
+    # This interface works consistently for RQ1, RQ2 and RQ3.
+    return ColumnTransformer([
+        ('text', TfidfVectorizer(ngram_range=(1, 3), min_df=3,
+                                max_df=0.98, sublinear_tf=True, max_features=18000,
+                                strip_accents='unicode', lowercase=True), 'text_clean')
+    ], remainder='drop')
+
+def candidates():
+    return {
+        'Dummy (baseline)': DummyClassifier(strategy='prior'),
+        'Logistic Regression': LogisticRegression(max_iter=1500, class_weight='balanced'),
+        'Linear SVM': LinearSVC(class_weight='balanced', random_state=RANDOM_STATE),
+        'Random Forest': RandomForestClassifier(n_estimators=120, min_samples_leaf=3,
+            max_features='sqrt', class_weight='balanced_subsample',
+            random_state=RANDOM_STATE, n_jobs=-1)
+    }
+
+def run_classification(name, X, y, preprocessor, binary=True, groups=None):
+    if groups is None:
+        groups = X['text_clean'].fillna('').str.lower().str.strip()
+    groups = pd.Series(np.asarray(groups), index=X.index)
+    tr, te = split_reviews(X, y, groups)
+    Xtr, Xte = X.iloc[tr], X.iloc[te]
+    ytr, yte = y.iloc[tr], y.iloc[te]
+    cv = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    training_groups = groups.iloc[tr] if hasattr(groups, 'iloc') else np.asarray(groups)[tr]
+    # AP captures precision-recall performance when the positive class is rare.
+    scoring = {'ap': 'average_precision', 'f1': 'f1', 'roc_auc': 'roc_auc'} if binary else {
+        'macro_f1': 'f1_macro', 'accuracy': 'accuracy'}
+    rows = []
+    for label, estimator in candidates().items():
+        pipe = Pipeline([('features', clone(preprocessor)), ('model', clone(estimator))])
+        result = cross_validate(pipe, Xtr, ytr, scoring=scoring, cv=cv,
+                                n_jobs=1, groups=training_groups, error_score='raise')
+        rows.append({'model': label, **{k: np.mean(result['test_' + k]) for k in scoring}})
+    table = pd.DataFrame(rows)
+    primary = 'ap' if binary else 'macro_f1'
+    table = table.sort_values(primary, ascending=False).reset_index(drop=True)
+    print('\n', name, '— training-fold cross-validation (higher is better)')
+    display(table.round(4))
+    winner = table.iloc[0]['model']
+    # Never use Dummy for explanations; fall back to the strongest non-dummy model.
+    explanatory = next(m for m in table.model if not m.startswith('Dummy'))
+    print('Selected:', winner, '| Explanatory model:', explanatory)
+    best_pipe = Pipeline([('features', clone(preprocessor)), ('model', candidates()[winner])])
+    best_pipe.fit(Xtr, ytr)
+    pred = best_pipe.predict(Xte)
+    print('Held-out classification report:')
+    print(classification_report(yte, pred, zero_division=0))
+    # Visualize a real model, even if the dummy baseline happens to win.
+    plot_label = winner if not winner.startswith('Dummy') else explanatory
+    plot_pipe = best_pipe if plot_label == winner else Pipeline([
+        ('features', clone(preprocessor)), ('model', candidates()[plot_label])]).fit(Xtr, ytr)
+    ConfusionMatrixDisplay.from_estimator(plot_pipe, Xte, yte, cmap='Blues')
+    plt.title(f'{name}: test confusion matrix — {plot_label}')
+    plt.show()
+    if binary:
+        PrecisionRecallDisplay.from_estimator(plot_pipe, Xte, yte)
+        plt.title(f'{name}: test precision–recall — {plot_label}')
+        plt.show()
+    return {'table': table, 'winner': winner, 'best': best_pipe,
+            'explanation_model': explanatory, 'plot_model': plot_pipe,
+            'X_train': Xtr, 'X_test': Xte, 'y_train': ytr, 'y_test': yte}
+
+def show_text_features(result, n=15):
+    label = result['explanation_model']
+    if label == result['winner'] and not label.startswith('Dummy'):
+        model_pipe = result['best']
+    else:
+        model_pipe = Pipeline([('features', text_transformer()),
+                               ('model', candidates()[label])])
+        model_pipe.fit(result['X_train'], result['y_train'])
+    # For pure-text experiments, feature names come from the text ColumnTransformer.
+    model = model_pipe.named_steps['model']
+    features = model_pipe.named_steps['features'].get_feature_names_out()
+    if hasattr(model, 'coef_'):
+        weights = np.asarray(model.coef_)
+        if weights.shape[0] == 1:
+            order = np.argsort(weights[0])
+            indices = np.r_[order[:n], order[-n:]]
+            values = weights[0, indices]
+            plt.figure(figsize=(10, 9))
+            plt.barh(np.arange(len(indices)), values)
+            plt.yticks(np.arange(len(indices)), features[indices]); plt.axvline(0, color='gray')
+            plt.title(f'{label}: negative vs positive text coefficients')
+            plt.tight_layout(); plt.show()
+        else:
+            for j, class_name in enumerate(model.classes_):
+                indices = np.argsort(weights[j])[-n:]
+                plt.figure(figsize=(9, 5))
+                plt.barh(features[indices], weights[j, indices])
+                plt.title(f'{label}: terms associated with {class_name}')
+                plt.tight_layout(); plt.show()
+    elif hasattr(model, 'feature_importances_'):
+        indices = np.argsort(model.feature_importances_)[-n:]
+        plt.figure(figsize=(9, 5))
+        plt.barh(features[indices], model.feature_importances_[indices])
+        plt.title(f'{label}: TF-IDF feature importance')
+        plt.tight_layout(); plt.show()
+    print('Important terms are predictive associations, not causal effects.')
+```
+
+
+
+
+## 6. RQ1 — Predicting Supplied Sentiment from Text
+
+Use **average precision** as the primary metric because the positive class is less common; also inspect F1 and ROC-AUC. The positive class is explicitly coded as 1. Coefficients are inspected from the best non-dummy model, refitted on training data only if needed.
+
+```{python}
+X1 = df[['text_clean']].copy()
+y1 = df['sentiment'].eq('Positive').astype(int)
+rq1 = run_classification('RQ1 sentiment', X1, y1, text_transformer(), binary=True)
+# All text-only models use a DataFrame-compatible TF-IDF transformer.
+show_text_features(rq1)
+```
+
+
+### RQ1 — Sentiment Prediction: Results and Interpretation
+
+**Research Objective:** This research question investigates whether dating app review text can accurately predict overall user sentiment (Positive or Negative). TF-IDF features with unigrams, bigrams, and trigrams were used to represent textual information. Four classification models were compared: Logistic Regression, Linear SVM, Random Forest, and a Dummy baseline.
+
+**Model Comparison and Selection:** Logistic Regression achieved the highest cross-validation Average Precision (0.9153) and F1-score (0.8424), followed closely by Linear SVM (AP = 0.9148, F1 = 0.8409). Although Linear SVM obtained a slightly higher ROC-AUC (0.9571 versus 0.9563), Logistic Regression was selected based on Average Precision, the primary evaluation metric chosen to account for class imbalance. Random Forest performed less effectively (AP = 0.8465), while the Dummy baseline achieved an AP of only 0.2772. The small performance difference between the two linear models suggests that both are competitive approaches.
+
+**Test Set Performance:** Logistic Regression achieved approximately 92.2% accuracy on the held-out test set of 2,141 reviews. The confusion matrix shows 1,490 correctly classified negative reviews and 483 correctly classified positive reviews, with 58 false positives and 110 false negatives. For the positive class, precision reached approximately 0.89, recall 0.81, and F1-score 0.85. The model demonstrated stronger recall for negative reviews (0.96), indicating that positive reviews were more likely to be misclassified.
+
+**Precision–Recall Analysis:** The test Precision–Recall curve achieved an Average Precision of approximately 0.93, indicating strong discrimination between positive and negative reviews. Precision remained high across much of the recall range but declined as recall approached 1.0. This illustrates the trade-off between identifying more positive reviews and increasing false positive predictions.
+
+**Feature Importance:** Logistic Regression coefficients revealed several meaningful textual predictors. Words such as *good, great, excellent, amazing, love,* and *nice* were strongly associated with positive sentiment. The terms *met* and *found* also showed positive associations, potentially reflecting favorable matching experiences. In contrast, *worst, scam, fake, useless, money, banned,* and *login* were associated with negative sentiment. These terms suggest that negative reviews frequently contain language related to dissatisfaction, financial concerns, account restrictions, and profile authenticity. However, coefficient values represent predictive associations rather than causal effects.
+
+**Limitations:** The dataset contains substantially more negative than positive reviews, which may contribute to differences in class-specific recall. Furthermore, sentiment labels correspond directly to rating categories, meaning the model learns to predict rating-derived sentiment rather than independently validated emotional meaning. TF-IDF may also struggle with sarcasm, indirect complaints, and multiple sentiments within the same review.
+
+**Conclusion:** Logistic Regression was selected as the best-performing model based on cross-validation Average Precision and demonstrated strong generalization on the held-out test set. The results confirm that review text contains useful information for predicting overall sentiment. However, Aspect-Based Sentiment Analysis remains necessary to investigate the specific reasons behind user satisfaction and dissatisfaction.
+
+
+
+
+
+## 7. RQ2 — Predicting Review Engagement
+
+The outcome is **at least one thumbs-up**, not the raw count. This avoids forcing a regression model to explain a strongly zero-inflated count distribution. Average precision is used if positive reviews are uncommon; a dummy prior baseline quantifies how much performance exceeds prevalence. Text, platform, and length are allowed, but sentiment, rating, and satisfaction are intentionally excluded.
+
+```{python}
+X2 = df[['text_clean', 'app_name', 'review_word_count']].copy()
+y2 = df['has_thumbs_up']
+pre2 = ColumnTransformer([
+    ('text', TfidfVectorizer(ngram_range=(1, 3), min_df=3, max_df=0.98,
+                             sublinear_tf=True, max_features=18000,
+                             strip_accents='unicode', lowercase=True), 'text_clean'),
+    ('app', OneHotEncoder(handle_unknown='ignore'), ['app_name']),
+    ('length', Pipeline([('impute', SimpleImputer(strategy='median')),
+                         ('scale', StandardScaler(with_mean=False))]), ['review_word_count'])
+], sparse_threshold=1.0)
+rq2 = run_classification('RQ2 engagement', X2, y2, pre2, binary=True)
+
+# Interpret the best non-dummy model using a matched pipeline, not the baseline.
+explainer2 = Pipeline([('features', pre2), ('model', candidates()[rq2['explanation_model']])])
+explainer2.fit(rq2['X_train'], rq2['y_train'])
+feature_names2 = explainer2.named_steps['features'].get_feature_names_out()
+m2 = explainer2.named_steps['model']
+if hasattr(m2, 'coef_'):
+    weights2 = m2.coef_[0]
+else:
+    weights2 = m2.feature_importances_
+idx2 = np.argsort(np.abs(weights2))[-20:]
+plt.figure(figsize=(10, 7)); plt.barh(feature_names2[idx2], weights2[idx2])
+plt.title('RQ2: strongest predictive features (coefficient or importance)')
+plt.tight_layout(); plt.show()
+```
+
+
+### RQ2 — Review Engagement Prediction: Results and Interpretation
+
+**Research Objective:** This research question investigates whether review text and related features can predict engagement, defined as receiving at least one thumbs-up. Four classification models were evaluated: Random Forest, Logistic Regression, Linear SVM, and a Dummy baseline.
+
+**Model Comparison and Selection:** Random Forest achieved the highest cross-validation Average Precision (0.7925) and F1-score (0.7396), narrowly outperforming Logistic Regression (AP = 0.7916, F1 = 0.7309). Although Logistic Regression obtained a slightly higher ROC-AUC (0.8025 versus 0.8010), Random Forest was selected based on Average Precision, the primary evaluation metric. The difference between the two leading models was very small, suggesting comparable predictive performance. Both substantially outperformed the Dummy baseline (AP = 0.5127).
+
+**Test Set Performance:** Random Forest achieved approximately 70.7% accuracy on the held-out test set of 2,141 reviews. The confusion matrix shows 704 true negatives, 809 true positives, 340 false positives, and 288 false negatives. For reviews receiving at least one thumbs-up, precision was approximately 0.70, recall 0.74, and F1-score 0.72. These results demonstrate moderate predictive ability, although a substantial proportion of reviews were still misclassified.
+
+**Precision–Recall Analysis:** The test Precision–Recall curve achieved an Average Precision of approximately 0.76, exceeding the positive-class prevalence of approximately 0.51. Precision was relatively high at lower recall levels but declined as recall increased. This indicates that the model can identify some highly likely engagement cases with reasonable precision, but performance becomes less reliable when attempting to capture nearly all engaged reviews.
+
+**Feature Importance:** Random Forest feature importance identified review word count as the strongest individual predictor, suggesting that review length contains useful information for engagement classification. Other influential features included common textual terms such as *to, the, and, they,* and *you*, as well as more content-related words such as *money, good,* and *app*. However, impurity-based feature importance does not indicate whether a feature increases or decreases engagement probability. It may also favor continuous variables, so additional analysis using permutation importance would improve interpretability.
+
+**Comparison with RQ1:** Engagement prediction was substantially less accurate than sentiment prediction. While sentiment is often directly reflected in review wording, engagement may depend on additional factors such as visibility, posting time, audience exposure, and user activity. Some of these factors are not available in the dataset, potentially limiting predictive performance.
+
+**Limitations:** The target variable measures whether a review received at least one thumbs-up rather than the total number of likes or overall review quality. Furthermore, the observational nature of the dataset prevents causal conclusions about which textual characteristics generate engagement.
+
+**Conclusion:** Random Forest was selected as the best-performing model based on cross-validation Average Precision and demonstrated moderate predictive performance on unseen reviews. Review length emerged as an important predictive feature, while textual characteristics provided additional information. However, engagement remains more difficult to predict than sentiment, and the findings should be interpreted as predictive associations rather than causal relationships.
+
+
+
+
+
+
+
+## 8. RQ3 — Which App Does a Review Describe?
+
+**Macro-F1** is the primary metric because each app should contribute equally regardless of sample size. Text-only prediction measures app-specific language, not product quality. The classifier may learn direct mentions of app names; this is useful for identification but not evidence of deeper differences. The plot shows test-set errors, while feature coefficients show distinctive terms.
+
+```{python}
+X3 = df[['text_clean']].copy()
+y3 = df['app_name']
+rq3 = run_classification('RQ3 app identity', X3, y3, text_transformer(), binary=False)
+show_text_features(rq3)
+```
+
+
+### RQ3 — Dating App Identification: Results and Interpretation
+
+**Research Objective:** This research question examines whether review text can identify the dating app being discussed: Bumble, Hinge, or Tinder. TF-IDF text features were used in a multiclass classification task, comparing Logistic Regression, Random Forest, Linear SVM, and a Dummy baseline.
+
+**Model Comparison and Selection:** Logistic Regression achieved the highest cross-validation Macro-F1 (0.5580) and accuracy (0.5595), followed closely by Random Forest (Macro-F1 = 0.5537) and Linear SVM (0.5419). The Dummy baseline obtained a Macro-F1 of only 0.1710. Macro-F1 was selected as the primary evaluation metric because it gives equal importance to all three platforms. Logistic Regression was therefore selected as the best-performing model, although its advantage over Random Forest was relatively small.
+
+**Test Set Performance:** Logistic Regression achieved approximately 57.2% accuracy and a Macro-F1 of 0.57 on the held-out test set of 2,142 reviews. The model correctly classified 409 Bumble reviews, 426 Hinge reviews, and 390 Tinder reviews. Hinge achieved the highest class-specific F1-score (0.59), followed by Bumble (0.58) and Tinder (0.55). Misclassifications occurred across all three platforms, suggesting substantial overlap in the language used to describe dating app experiences.
+
+**Feature Importance:** Logistic Regression coefficients revealed several platform-associated terms. Bumble reviews were associated with words such as *login, code, premium, blocked,* and *load*, potentially reflecting discussions of account access, subscriptions, and technical functionality. Hinge reviews were associated with *met, found, voice, roses, deleted,* and *banned*, suggesting references to matching experiences, platform features, and account management. Tinder reviews were associated with *gold, platinum, bio, photo verification,* and *locked*, highlighting membership tiers, profile information, and verification-related discussions. These coefficients represent predictive associations rather than direct measures of feature quality or user dissatisfaction.
+
+**Platform-Name Dependence:** An important limitation is that the strongest predictive terms for each platform were the platform names themselves: *bumble, hinge,* and *tinder*. Consequently, part of the model's classification ability may result from explicit app mentions rather than deeper differences in user language. A useful follow-up experiment would remove or mask platform names before training and compare the resulting Macro-F1 with the original model. This would provide a more meaningful assessment of whether platform-specific language patterns remain identifiable.
+
+**Limitations:** Although the model substantially outperformed the Dummy baseline, its moderate classification performance indicates that the three platforms share considerable vocabulary. Additionally, platform-associated terms do not necessarily indicate higher issue frequency or stronger sentiment. Differences in review topics, writing styles, and explicit app mentions may all influence classification results.
+
+**Conclusion:** Logistic Regression was selected as the best-performing model and demonstrated moderate ability to identify dating apps from review text. The results suggest that reviews contain some platform-specific vocabulary, particularly related to subscriptions, account management, matching experiences, and verification features. However, further analysis using platform-name masking is recommended to distinguish genuine linguistic differences from direct references to app identities.
+
+
+
+
+
+## 9. RQ4 — Platform and Monthly Sentiment Trends
+
+This question is **descriptive**. There is no defensible causal estimate of whether one app produces more dissatisfaction: the dataset may be selectively collected, and rating-derived sentiment is not independently annotated. Small month-app cells should be interpreted cautiously.
+
+```{python}
+monthly = (df.dropna(subset=['posted_at'])
+           .groupby(['month', 'app_name'], as_index=False)
+           .agg(n_reviews=('sentiment', 'size'),
+                negative_share=('sentiment', lambda s: s.eq('Negative').mean())))
+display(monthly.sort_values(['month','app_name']))
+fig, ax = plt.subplots(figsize=(11, 5))
+for app, sub in monthly.groupby('app_name'):
+    sub = sub.sort_values('month')
+    ax.plot(sub['month'], sub['negative_share'], marker='o', label=app)
+ax.set_ylim(0, 1); ax.set_ylabel('Negative share among observed reviews')
+ax.set_xlabel('Month'); ax.set_title('Observed negative-review share over time')
+ax.legend(); plt.xticks(rotation=45); plt.tight_layout(); plt.show()
+print('Review counts per month/app (check before interpreting fluctuations):')
+display(monthly.pivot(index='month', columns='app_name', values='n_reviews'))
+```
+
+
+### RQ4 — Sentiment Trends Over Time: Results and Interpretation
+
+**Research Objective:** This research question examines how the proportion of negative dating app reviews changed over time across Bumble, Hinge, and Tinder. Monthly negative-review shares were calculated using observed sentiment labels, with descriptive time-series analysis rather than predictive modeling.
+
+**Overall Sentiment Trends:** Bumble consistently exhibited the highest negative-review share, ranging from approximately 78% to 86% between June and September 2026. Its negative proportion peaked in July before declining in August and September. Hinge showed a relatively stable negative-review share of approximately 72%–76% from May to September, with only minor fluctuations. Tinder maintained the lowest negative-review share, ranging from approximately 56% to 64% between July and September, increasing in August before declining in September.
+
+**Monthly Sample Size and Coverage:** The number of reviews varied considerably across platforms and months. Bumble had 241 reviews in June compared with 1,651 in July, while Tinder increased from 300 reviews in July to 2,097 in August. Hinge had more consistent monthly coverage, with approximately 960–990 reviews during June–August. Additionally, Hinge covered five months, Bumble four months, and Tinder only three months. Therefore, July–September represents the most appropriate common period for direct cross-platform comparisons. Months without observations should not be interpreted as having zero negative sentiment.
+
+**Interpretation:** The results indicate that negative sentiment proportions differ across platforms and fluctuate over time. Bumble maintained the highest negative share despite a decline after July, while Tinder had the lowest negative share across the observed common months. Hinge demonstrated comparatively stable sentiment patterns. However, these changes reflect the composition of collected reviews rather than confirmed improvements or deterioration in platform quality.
+
+**Limitations:** Uneven monthly sample sizes and incomplete temporal coverage limit direct comparisons. Differences in review collection, user participation, or sample composition may also influence the observed trends. Furthermore, sentiment labels are directly associated with rating categories, meaning the analysis reflects rating-derived sentiment. The short observation period does not support reliable long-term forecasting or causal conclusions.
+
+**Conclusion:** RQ4 reveals distinct monthly negative-review patterns across the three dating apps. Bumble consistently had the highest negative proportion, Hinge remained relatively stable, and Tinder showed the lowest negative proportion with some fluctuations. Further analysis using confidence intervals and monthly aspect-level sentiment could help assess the reliability of these patterns and identify which user concerns changed over time.
+
+
+
+
+
+
+
+
+## 10. RQ5 — Text-Based Review Clusters
+
+Use trigram-capable TF-IDF, then **TruncatedSVD** to obtain a compact semantic representation. L2 normalization follows SVD. Compare **elbow inertia** and **silhouette** over k = 2...8; silhouette is computed on a fixed reproducible sample for tractability. Do not automatically choose the maximum silhouette. The selection rule below first finds the knee of the normalized inertia curve (maximum distance from the endpoint line), then prefers a nearby k (within ±1) if its silhouette is within 90% of the best. Inspect both plots and the top terms before interpreting any group. These are *themes*, not ground-truth user types.
+
+```{python}
+texts = df['text_clean'].fillna('')
+vec5 = TfidfVectorizer(ngram_range=(1,3), min_df=5, max_df=.98,
+                       max_features=15000, sublinear_tf=True)
+X5_tfidf = vec5.fit_transform(texts)
+n_comp = min(60, X5_tfidf.shape[1]-1, X5_tfidf.shape[0]-1)
+svd5 = TruncatedSVD(n_components=n_comp, random_state=RANDOM_STATE)
+X5 = Normalizer().fit_transform(svd5.fit_transform(X5_tfidf))
+print('Explained variance (SVD):', round(svd5.explained_variance_ratio_.sum(), 3))
+ks = list(range(2,9))
+inertias, silhouettes = [], []
+rng = np.random.default_rng(RANDOM_STATE)
+sample_idx = rng.choice(len(X5), size=min(2500, len(X5)), replace=False)
+for k in ks:
+    km = MiniBatchKMeans(n_clusters=k, random_state=RANDOM_STATE,
+                         batch_size=1024, n_init=5, max_iter=150)
+    labels = km.fit_predict(X5)
+    inertias.append(km.inertia_)
+    silhouettes.append(silhouette_score(X5[sample_idx], labels[sample_idx]))
+score5 = pd.DataFrame({'k': ks, 'inertia': inertias, 'silhouette': silhouettes})
+display(score5.round(4))
+fig, ax = plt.subplots(1, 2, figsize=(12,4))
+ax[0].plot(ks, inertias, 'o-'); ax[0].set_title('Elbow: inertia'); ax[0].set_xlabel('k')
+ax[1].plot(ks, silhouettes, 'o-'); ax[1].set_title('Silhouette (sampled)'); ax[1].set_xlabel('k')
+plt.tight_layout(); plt.show()
+# Maximum distance from the straight line connecting the normalized endpoints.
+y_norm = (np.array(inertias)-min(inertias))/(max(inertias)-min(inertias)+1e-12)
+x_norm = (np.array(ks)-min(ks))/(max(ks)-min(ks))
+line = y_norm[0] + (y_norm[-1]-y_norm[0])*x_norm
+elbow_k = ks[int(np.argmax(np.abs(y_norm-line)))]
+best_sil_k = ks[int(np.argmax(silhouettes))]
+nearby = [k for k,s in zip(ks,silhouettes)
+          if abs(k-elbow_k)<=1 and s >= max(silhouettes)-0.1*abs(max(silhouettes))]
+chosen_k = max(nearby, key=lambda k: silhouettes[ks.index(k)]) if nearby else elbow_k
+print('Elbow heuristic:', elbow_k, '| best silhouette:', best_sil_k,
+      '| jointly selected k:', chosen_k)
+print('If the elbow is ambiguous, interpret the result as exploratory and inspect alternatives.')
+km_final = MiniBatchKMeans(n_clusters=chosen_k, random_state=RANDOM_STATE,
+                           batch_size=1024, n_init=10, max_iter=200)
+df['cluster'] = km_final.fit_predict(X5)
+cluster_profile = df.groupby('cluster').agg(
+    count=('cluster','size'),
+    positive_share=('sentiment',lambda x: x.eq('Positive').mean()),
+    thumbs_up_share=('has_thumbs_up','mean'),
+    mean_words=('review_word_count','mean'))
+display(cluster_profile.round(3))
+display(pd.crosstab(df.cluster, df.app_name, normalize='index').round(3))
+# Describe each cluster by average original TF-IDF weights, not arbitrary SVD axes.
+terms = vec5.get_feature_names_out()
+for c in sorted(df.cluster.unique()):
+    mask = (df.cluster.to_numpy()==c)
+    avg = np.asarray(X5_tfidf[mask].mean(axis=0)).ravel()
+    top = np.argsort(avg)[-12:][::-1]
+    print(f'Cluster {c} (n={mask.sum()}):', ', '.join(terms[top]))
+fig, ax = plt.subplots(figsize=(10,5))
+sns.countplot(data=df, x='cluster', hue='app_name', ax=ax)
+ax.set_title('App composition of text clusters'); plt.tight_layout(); plt.show()
+```
+
+
+### RQ5 — Review Text Clustering: Results and Interpretation
+
+**Research Objective:** This research question investigates whether dating app reviews can be grouped into meaningful clusters based on textual similarity and whether these clusters differ in sentiment, engagement, review length, and platform composition. TF-IDF features, Singular Value Decomposition (SVD), and K-Means clustering were used to analyze 10,709 reviews.
+
+**Cluster Number Selection:** Both the Elbow Method and Silhouette Score were considered when selecting the number of clusters. The elbow heuristic suggested k = 6, while the highest sampled Silhouette Score occurred at k = 2 (0.0590). The final selection of k = 6 prioritized more detailed segmentation and interpretability, although its Silhouette Score was relatively low (0.0393). The elbow was not clearly defined, and the increase in inertia from k = 6 to k = 7 suggests that clustering stability should be investigated further. Therefore, k = 6 should be interpreted as an exploratory choice rather than a definitively optimal solution.
+
+**Dimensionality Reduction:** SVD retained approximately 16.8% of the variance in the original TF-IDF representation. While dimensionality reduction made clustering more manageable, the relatively low explained variance indicates that substantial textual variation was not preserved, potentially limiting cluster separation.
+
+**Cluster Characteristics:** Six clusters were identified with distinct descriptive patterns:
+
+- **Cluster 0 — Strongly Negative Expressions (n = 147):** Dominated by terms such as *terrible* and *terrible experience*. Only 2.0% of reviews were positive, indicating a concentration of strongly negative language.
+- **Cluster 1 — General App Evaluations (n = 921):** Characterized by general phrases such as *this app* and *app is*. The positive-review share was 23.2%, although the cluster lacked a clearly identifiable substantive topic.
+- **Cluster 2 — Short Positive Feedback (n = 4,016):** Associated with words such as *good, nice, great,* and *excellent*. This was the largest cluster, with the highest positive-review share (51.8%), the shortest average review length (7.4 words), and the lowest thumbs-up share (28.3%).
+- **Cluster 3 — Long-form Reviews (n = 2,645):** Characterized primarily by common functional words and longer reviews, averaging 43.5 words. Its positive-review share was 16.1%, while 68.2% of reviews received at least one thumbs-up. The absence of distinctive topic terms limits its semantic interpretation.
+- **Cluster 4 — Account and Login Issues (n = 1,492):** Associated with terms such as *account, my account,* and *login*. Only 5.9% of reviews were positive, and Bumble accounted for 51.7% of the cluster.
+- **Cluster 5 — Payment-related Discussions (n = 1,488):** Associated with terms such as *pay* and *if you*. The cluster had a low positive-review share (10.6%) but the highest thumbs-up share (72.8%), suggesting that reviews in this group frequently received engagement.
+
+These cluster labels are provisional interpretations based on prominent terms and should be validated by examining representative reviews.
+
+**Platform Composition:** Cluster composition differed across dating apps. Tinder accounted for the largest share of Cluster 2 (40.7%), Hinge was most represented in Cluster 3 (41.2%) and Cluster 5 (40.4%), while Bumble dominated Cluster 4 (51.7%). The concentration of Bumble reviews in the account-related cluster is consistent with the platform-associated terms identified in RQ3. However, these figures represent platform composition within clusters rather than the prevalence of each topic within individual platforms.
+
+**Sentiment and Engagement Patterns:** One important finding is that positive sentiment and engagement did not consistently increase together. Cluster 2 had the highest positive-review share but the lowest thumbs-up share, whereas Cluster 5 had a relatively low positive-review share and the highest engagement share. This suggests that negative or issue-related reviews may attract substantial user interaction. Nevertheless, these relationships are descriptive and do not establish that negative sentiment or review length causes higher engagement.
+
+**Limitations:** The clustering results have several limitations. First, the low Silhouette Scores indicate weak separation between clusters. Second, SVD preserved only a limited proportion of textual variance. Third, some clusters were dominated by common words rather than distinctive topics, suggesting that linguistic structure and review length may influence the clustering. Finally, the selected k = 6 was not consistently supported by both evaluation methods. Further validation using representative reviews, alternative preprocessing strategies, and clustering stability checks would improve interpretability.
+
+**Conclusion:** K-Means clustering identified six exploratory groups with different sentiment, engagement, review-length, and platform-composition patterns. Short positive reviews, account-related discussions, and payment-related language emerged as potentially meaningful distinctions. However, the weak cluster separation and limited semantic clarity mean that these groups should be interpreted as exploratory text patterns rather than definitive categories of user experience.
+
+
+
+
+
+
+
+## 11. Interpretation, Limitations, and Reproducibility
+
+Interpret the output *after running the notebook*. Report (i) the winning model and cross-validation scores for each supervised question, (ii) the held-out scores, (iii) the strongest non-dummy model features, (iv) descriptive monthly changes with denominators, and (v) the elbow, silhouette, selected k, and distinguishing cluster terms. A higher predictive score does not establish causality.
+
+**Unanswerable from these data:** Whether Tinder, Bumble, or Hinge actually causes higher user dissatisfaction; whether reviews represent all users; why a specific review received thumbs-up; whether an individual reviewer will remain on an app; and whether observed monthly shifts reflect genuine population-level changes. No user demographics or verified behavior records are provided.
+
+**Potential improvements:** Manually validated multi-label aspect and aspect-polarity annotations, contextual language models for complex negation and sarcasm, independent human sentiment annotation, explicit language detection for multilingual reviews, leakage audits for repeated/near-duplicate reviews, temporal holdout evaluation, and topic-model stability checks. A train/test split is necessary for prediction; cluster descriptions are exploratory and use the full dataset.
+
+```{python}
+summary = pd.DataFrame([
+    {'question':'RQ1 sentiment', 'selected_model':rq1['winner'], 'primary_metric':'CV average precision',
+     'cv_score':rq1['table'].iloc[0]['ap']},
+    {'question':'RQ2 engagement', 'selected_model':rq2['winner'], 'primary_metric':'CV average precision',
+     'cv_score':rq2['table'].iloc[0]['ap']},
+    {'question':'RQ3 app identity', 'selected_model':rq3['winner'], 'primary_metric':'CV macro-F1',
+     'cv_score':rq3['table'].iloc[0]['macro_f1']}
+])
+display(summary.round(4))
+print('RQ4: descriptive, no predictive model. RQ5: MiniBatchKMeans, chosen k =', chosen_k)
+```
